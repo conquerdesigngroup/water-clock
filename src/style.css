@@ -1,0 +1,28 @@
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: "Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  canvas#gl { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+
+  /* Fading hint — quiet, bottom-center, disappears once you've seen it */
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: max(14px, env(safe-area-inset-bottom));
+    text-align: center; font-size: 11px; letter-spacing: 0.14em;
+    color: rgba(255,255,255,.4); text-transform: lowercase;
+    pointer-events: none; user-select: none;
+    opacity: 0; animation: hint 9s ease forwards .8s;
+  }
+  @keyframes hint { 10% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
+
+  /* Reduced-motion veil: the whole piece is motion, so we start paused and let the user opt in */
+  #veil, #fail {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: #000; color: rgba(255,255,255,.75);
+    font-size: 13px; letter-spacing: .12em; text-align: center; line-height: 2;
+    padding: 24px; cursor: pointer;
+  }
+  #veil.show, #fail.show { display: grid; }
+  #fail { cursor: default; }
+  #fail a { color: inherit; }

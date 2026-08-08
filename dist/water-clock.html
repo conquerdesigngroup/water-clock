@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Water Clock — Fluid Glass</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: "Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  canvas#gl { display: block; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+
+  /* Fading hint — quiet, bottom-center, disappears once you've seen it */
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: max(14px, env(safe-area-inset-bottom));
+    text-align: center; font-size: 11px; letter-spacing: 0.14em;
+    color: rgba(255,255,255,.4); text-transform: lowercase;
+    pointer-events: none; user-select: none;
+    opacity: 0; animation: hint 9s ease forwards .8s;
+  }
+  @keyframes hint { 10% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
+
+  /* Reduced-motion veil: the whole piece is motion, so we start paused and let the user opt in */
+  #veil, #fail {
+    position: fixed; inset: 0; display: none; place-items: center;
+    background: #000; color: rgba(255,255,255,.75);
+    font-size: 13px; letter-spacing: .12em; text-align: center; line-height: 2;
+    padding: 24px; cursor: pointer;
+  }
+  #veil.show, #fail.show { display: grid; }
+  #fail { cursor: default; }
+  #fail a { color: inherit; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="hint">move to stir &nbsp;·&nbsp; keys 1–4 change theme &nbsp;·&nbsp; space pauses</div>
+<div id="veil">motion is paused<br><span style="opacity:.6">click to start the water clock</span></div>
+<div id="fail"></div>
+
+<script>
+"use strict";
+/* All GLSL lives here. The GLSL:name … END markers are parsed
+   by scripts/validate-shaders.js — keep them when adding shaders.    */
+
+const VERT = `
+attribute vec2 position;
+attribute vec2 uv;
+varying vec2 vUv;
+void main(){ vUv = uv; gl_Position = vec4(position, 0.0, 1.0); }`;
+
+/* -------------------------------- shaders -------------------------------- */
+/* Kept intentionally close to the original GLSL so the motion matches.      */
+
+const HEAD = `precision highp float;
+varying vec2 vUv;
+#define PI 3.14159265358979
+`;
+
+/*GLSL:copy*/
+const FRAG_COPY = HEAD + `
+uniform sampler2D inputMap;
+void main(){ gl_FragColor = texture2D(inputMap, vUv); }
+`;/*END*/
+
+/*GLSL:flow*/
+/* Pointer flowmap (OGL Flowmap): fading trail of stamped velocity.          */
+const FRAG_FLOW = HEAD + `
+uniform sampler2D tMap;
+uniform float uFalloff;      // stamp radius in uv units
+uniform float uAlpha;        // stamp opacity
+uniform float uDissipation;  // trail fade per frame
+uniform vec2  uMouse;        // uv, y-up
+uniform vec2  uVelocity;     // sim-pixels moved since last frame
+void main(){
+  vec4 color = texture2D(tMap, vUv) * uDissipation;
+  vec2 cursor = vUv - uMouse;
+  vec3 stamp = vec3(uVelocity * vec2(1.0, -1.0),
+                    1.0 - pow(1.0 - min(1.0, length(uVelocity)), 3.0));
+  float falloff = smoothstep(uFalloff, 0.0, length(cursor)) * uAlpha;
+  color.rgb = mix(color.rgb, stamp, vec3(falloff));
+  gl_FragColor = color;
+}
+`;/*END*/
+
+/*GLSL:fluidVelocity*/
+/* Velocity update: thickness gradient pushes fluid outward, viscosity
+   diffuses it, the flowmap stirs it, magnitude clamped at 10 px/step.       */
+const FRAG_FLUID_VELOCITY = HEAD + `
+uniform sampler2D pressureMap;   // chemicals; .a = liquid thickness field
+uniform sampler2D velocityMap;
+uniform sampler2D flowMap;
+uniform vec2 uSize;
+void main(){
+  vec2 delta = 2.0 / uSize;
+
+  vec2 velocity        = texture2D(velocityMap, vUv).rg;
+  vec2 velocity_left   = texture2D(velocityMap, vUv + delta * vec2(-1, 0)).rg;
+  vec2 velocity_right  = texture2D(velocityMap, vUv + delta * vec2( 1, 0)).rg;
+  vec2 velocity_bottom = texture2D(velocityMap, vUv + delta * vec2( 0,-1)).rg;
+  vec2 velocity_top    = texture2D(velocityMap, vUv + delta * vec2( 0, 1)).rg;
+
+  vec2 flow = texture2D(flowMap, vUv).rg;
+
+  float center = texture2D(pressureMap, vUv).a;
+  float right  = texture2D(pressureMap, vUv + delta * vec2( 1, 0)).a;
+  float left   = texture2D(pressureMap, vUv + delta * vec2(-1, 0)).a;
+  float top    = texture2D(pressureMap, vUv + delta * vec2( 0, 1)).a;
+  float bottom = texture2D(pressureMap, vUv + delta * vec2( 0,-1)).a;
+  vec2 gradient = vec2(right - left, top - bottom);
+
+  vec2 diffusion = (velocity_left + velocity_right + velocity_bottom + velocity_top) / 4.0 - velocity;
+  vec2 acceleration = -gradient * 0.01;
+
+  velocity = velocity * 0.9995 + acceleration / (center + 0.001) + diffusion + flow * 0.1;
+
+  float magnitude = length(velocity);
+  velocity = velocity / max(1e-5, magnitude) * min(10.0, magnitude);
+
+  gl_FragColor = vec4(velocity, 0.0, 1.0);
+}
+`;/*END*/
+
+/*GLSL:divergence*/
+/* Divergence of velocity, stored biased around 0.5 on a wide stencil.       */
+const FRAG_DIVERGENCE = HEAD + `
+uniform sampler2D velocityMap;
+uniform vec2 uSize;
+void main(){
+  vec2 delta = 4.0 / uSize;
+  vec2 left   = texture2D(velocityMap, vUv + delta * vec2(-1, 0)).rg;
+  vec2 right  = texture2D(velocityMap, vUv + delta * vec2( 1, 0)).rg;
+  vec2 bottom = texture2D(velocityMap, vUv + delta * vec2( 0,-1)).rg;
+  vec2 top    = texture2D(velocityMap, vUv + delta * vec2( 0, 1)).rg;
+  float divergent = (right.x - left.x) + (top.y - bottom.y);
+  gl_FragColor = vec4(vec2(divergent / 4.0 * 0.5 + 0.5), 0.0, 1.0);
+}
+`;/*END*/
+
+/*GLSL:correction*/
+/* Relax velocity along the divergence gradient — the original's compact
+   stand-in for a pressure projection. Repeated each iteration it keeps
+   the field near divergence-free, which is what makes it slosh like water. */
+const FRAG_CORRECTION = HEAD + `
+uniform sampler2D pressureMap;   // divergence texture from the pass above
+uniform sampler2D velocityMap;
+uniform vec2 uSize;
+void main(){
+  vec2 delta = 4.0 / uSize;
+  float left   = texture2D(pressureMap, vUv + delta * vec2(-1, 0)).r;
+  float right  = texture2D(pressureMap, vUv + delta * vec2( 1, 0)).r;
+  float bottom = texture2D(pressureMap, vUv + delta * vec2( 0,-1)).r;
+  float top    = texture2D(pressureMap, vUv + delta * vec2( 0, 1)).r;
+  vec2 gradient = vec2(right - left, top - bottom);
+  vec2 velocity = texture2D(velocityMap, vUv).rg + gradient * 2.0;
+  gl_FragColor = vec4(velocity, 0.0, 1.0);
+}
+`;/*END*/
+
+/*GLSL:advection*/
+/* Semi-Lagrangian advection: look upstream, blend 90% of what you find.    */
+const FRAG_ADVECTION = HEAD + `
+uniform sampler2D inputMap;
+uniform sampler2D velocityMap;
+uniform vec2 uSize;
+void main(){
+  vec2 delta = 1.0 / uSize;
+  vec2 velocity = texture2D(velocityMap, vUv).rg;
+  vec2 displacement = -velocity;
+  float factor = 0.9;
+  vec4 displaced = texture2D(inputMap, vUv + displacement * delta * 0.1);
+  gl_FragColor = texture2D(inputMap, vUv) * (1.0 - factor) + displaced * factor;
+}
+`;/*END*/
+
+/*GLSL:reactionDiffusion*/
+/* Gray–Scott with three chemicals. x is the substrate (fed toward 1);
+   y and z are the activators, regrown toward mask*0.1 wherever the time's
+   glyphs are — so the digits are a perpetual spring of liquid. feed drifts
+   across x, kill across y, so pattern character varies over the screen.
+   Output .a = 1 − x: the liquid thickness field everything else reads.     */
+const FRAG_REACTION_DIFFUSION = HEAD + `
+uniform sampler2D pressureMap;
+uniform sampler2D maskTexture;
+uniform float feed0;
+uniform float kill0;
+uniform vec2 uSize;
+void main(){
+  vec2 delta = 1.0 / uSize;
+
+  vec4 center = texture2D(pressureMap, vUv);
+  vec4 maskInput = texture2D(maskTexture, vUv);
+
+  vec4 left    = texture2D(pressureMap, vUv + delta * vec2(-1, 0));
+  vec4 right   = texture2D(pressureMap, vUv + delta * vec2( 1, 0));
+  vec4 bottom  = texture2D(pressureMap, vUv + delta * vec2( 0,-1));
+  vec4 top     = texture2D(pressureMap, vUv + delta * vec2( 0, 1));
+  vec4 corner1 = texture2D(pressureMap, vUv + delta * vec2(-1, 1));
+  vec4 corner2 = texture2D(pressureMap, vUv + delta * vec2( 1, 1));
+  vec4 corner3 = texture2D(pressureMap, vUv + delta * vec2(-1,-1));
+  vec4 corner4 = texture2D(pressureMap, vUv + delta * vec2( 1,-1));
+
+  vec4 laplacian = (left + right + bottom + top) * 0.2
+                 + (corner1 + corner2 + corner3 + corner4) * 0.05 - center;
+
+  float feed = feed0 + (vUv.x - 0.5) * 0.02;
+  float kill_compensated = kill0 - 7.0 * ((feed - 0.065) * (feed - 0.065)
+                                        - (feed0 - 0.065) * (feed0 - 0.065));
+  float kill = kill_compensated + abs(vUv.y - 0.5) * 0.04;
+
+  float mask = maskInput.r * 0.1;
+
+  vec3 diffusion = vec3(0.4, 0.1, 0.1) * 8.0;
+  vec3 reaction  = vec3(-1.0, 1.0, 1.0);
+  vec3 balance   = vec3(1.0, mask, mask);
+  vec3 damping   = vec3(feed, feed + kill, feed + kill);
+  vec3 density   = vec3(1.0, 0.0, 0.0);
+
+  vec3 change = diffusion * laplacian.xyz
+              + reaction * center.x * center.y * center.z
+              + (balance - center.xyz) * damping;
+
+  vec3 result = center.xyz + change * 0.3;
+  gl_FragColor.xyz = result.xyz;
+  gl_FragColor.a = 1.0 - dot(density, result);
+}
+`;/*END*/
+
+/*GLSL:backgroundClock*/
+/* The analog face: three lens-circles, one per hand, orbiting the center
+   at half the larger screen dimension. Each is a bright rim + faint fill,
+   and its interior refracts every layer drawn behind it. Layers sit at
+   different parallax depths, so tilting the device separates them.         */
+const FRAG_BACKGROUND_CLOCK = HEAD + `
+uniform vec2 uSize;
+uniform vec3 clockHands;     // hours, minutes, seconds (fractional)
+uniform vec3 bgcolor;
+uniform vec3 circlecolor1;
+uniform vec3 circlecolor2;
+uniform vec3 circlecolor3;
+uniform vec2 parallax;
+
+vec3 drawCircle(vec2 coord, float t){
+  float radius = max(uSize.x, uSize.y) * 0.5;
+  vec2 origin = vec2(sin(t * PI * 2.0), cos(t * PI * 2.0)) * radius;
+  coord -= origin;
+
+  float r = length(coord) / radius;
+  float f = 1.0 / (abs(r - 1.0) * 100.0 + 1.0);
+
+  vec2 displacement = -coord / (sqrt(max(0.0, 1.0 - r * r)) + 0.01) * f * step(r, 1.0);
+
+  f = 1.0 / (abs(r - 1.0) * 200.0 + 1.0);
+  f = f + step(r, 1.0) * 0.05 * (r + 1.0);
+
+  return vec3(displacement, f);
+}
+
+void main(){
+  vec2 coord = (vUv - 0.5) * uSize + parallax * 2.0;
+
+  vec3 circle3 = drawCircle(coord, clockHands.z / 60.0);   // second
+  coord += circle3.xy * 0.1 + parallax * 10.0;
+  vec3 circle2 = drawCircle(coord, clockHands.y / 60.0);   // minute
+  coord += circle2.xy * 0.1 + parallax * 20.0;
+  vec3 circle1 = drawCircle(coord, clockHands.x / 12.0);   // hour
+
+  vec3 color = bgcolor;
+  color = mix(color, circlecolor1, circle1.z);
+  color = mix(color, circlecolor2, circle2.z);
+  color = mix(color, circlecolor3, circle3.z);
+
+  gl_FragColor = vec4(color, 1.0);
+}
+`;/*END*/
+
+/*GLSL:glass*/
+/* Liquid glass composite, 2×2 supersampled:
+   thickness → normal → refract in and out of water (n 1.33) → sample the
+   background with slight per-channel offsets (chromatic fringe) → add a
+   thresholded specular streak and a Fresnel-weighted edge → tint.          */
+const FRAG_GLASS = HEAD + `
+uniform sampler2D pressureMap;
+uniform sampler2D backgroundMap;
+uniform vec3 glassColor;
+uniform float shadowFactor;
+uniform float brightFactor;
+uniform vec2 parallax;
+uniform vec2 uSize;
+
+vec3 my_reflection(vec3 normal, vec3 incoming){
+  float cos_value = dot(incoming, normal);
+  vec3 cos_vec = cos_value * normal;
+  vec3 reflected = incoming - cos_vec * 2.0;
+  return reflected / length(reflected);
+}
+
+vec3 my_refraction(vec3 normal, vec3 incoming, float n2){
+  float cos_value = dot(incoming, normal);
+  vec3 cos_vec = cos_value * normal;
+  vec3 sin_vec = incoming - cos_vec;
+  float sin_value = length(sin_vec);
+  float cos_value22 = n2 * n2 - sin_value * sin_value;
+  if (cos_value22 < 0.0) return my_reflection(normal, incoming);
+  float cos_value2 = sqrt(cos_value22);
+  vec3 refracted = cos_value2 * normal + sin_vec;
+  return refracted / length(refracted);
+}
+
+float thickness(vec4 p){
+  float t = smoothstep(0.45, 0.95, p.a);
+  return sqrt(t);
+}
+
+void main(){
+  vec2 delta = 1.0 / uSize;
+  vec4 final_color = vec4(0.0);
+
+  for (int si = 0; si < 2; si++){
+    for (int sj = 0; sj < 2; sj++){
+      vec2 uv = vUv + delta * vec2(float(si), float(sj)) * 0.5;
+
+      vec4 center = texture2D(pressureMap, uv);
+      vec4 left   = texture2D(pressureMap, uv + delta * vec2(-1, 0));
+      vec4 right  = texture2D(pressureMap, uv + delta * vec2( 1, 0));
+      vec4 bottom = texture2D(pressureMap, uv + delta * vec2( 0,-1));
+      vec4 top    = texture2D(pressureMap, uv + delta * vec2( 0, 1));
+
+      vec2 gradient = vec2(thickness(right) - thickness(left),
+                           thickness(top) - thickness(bottom)) * 0.7;
+
+      vec3 normal = vec3(-gradient.x, -gradient.y, 1.0);
+      normal = normal / length(normal);
+
+      vec3 incoming = vec3(parallax, 1.0);
+      incoming = incoming / length(incoming);
+
+      float n2 = 1.33;
+      vec3 refracted = my_refraction(normal, incoming, n2);
+      refracted = my_refraction(normal * vec3(-1.0, -1.0, 1.0), refracted, 1.0 / n2);
+
+      vec2 displacement = refracted.xy / refracted.z - parallax;
+
+      float r_r = texture2D(backgroundMap, uv + displacement * 1.0 ).r;
+      float r_g = texture2D(backgroundMap, uv + displacement * 1.05).g;
+      float r_b = texture2D(backgroundMap, uv + displacement * 1.1 ).b;
+      vec4 background_T = vec4(r_r, r_g, r_b, 1.0);
+
+      vec3 incoming_clamped = incoming;
+      incoming_clamped.z = clamp(incoming_clamped.z, 0.8, 1.0);
+      incoming_clamped.xy /= max(length(incoming_clamped.xy), 0.0001);
+      incoming_clamped.xy *= sqrt(1.0 - incoming_clamped.z);
+      vec3 reflected_clamped = my_reflection(normal, incoming_clamped);
+
+      float light = abs(dot(reflected_clamped, vec3(-0.1, 0.6, 0.01)));
+      light = step(0.1, light) * light * 8.0;
+
+      vec4 background_R = vec4(vec3(light), 0.0) * vec4(glassColor, 1.0);
+
+      float R = pow(1.0 - normal.z, 0.5) * smoothstep(0.0, 0.01, thickness(center));
+      float t = thickness(center);
+
+      vec4 color = background_R * R
+                 + background_T * (1.0 - R) * (1.0 - shadowFactor * t)
+                 + (t * brightFactor);
+      color.rgb = color.rgb * mix(vec3(1.0), glassColor, t);
+      final_color = final_color + color * 0.25;
+    }
+  }
+
+  gl_FragColor = vec4(final_color.rgb, 1.0);
+}
+`;/*END*/
+
+/*GLSL:debugView*/
+const FRAG_DEBUG = HEAD + `
+uniform sampler2D inputMap;
+uniform float uMode;   // 0 raw, 1 signed rg, 2 alpha
+void main(){
+  vec4 c = texture2D(inputMap, vUv);
+  if (uMode < 0.5)      gl_FragColor = vec4(c.rgb, 1.0);
+  else if (uMode < 1.5) gl_FragColor = vec4(c.rg * 0.05 + 0.5, 0.5, 1.0);
+  else                  gl_FragColor = vec4(vec3(c.a), 1.0);
+}
+`;/*END*/
+
+/* ------------------------------- parameters ------------------------------ */
+
+const qs = new URLSearchParams(location.search);
+const num = (k, d) => {
+  if (!qs.has(k)) return d;
+  const v = parseFloat(qs.get(k));
+  return Number.isFinite(v) ? v : d;
+};
+const hex = (k, d) => {
+  if (!qs.has(k)) return d;
+  const h = qs.get(k).replace(/^#/, "");
+  if (!/^[0-9a-f]{6}$/i.test(h)) return d;
+  return [0,2,4].map(i => parseInt(h.slice(i, i+2), 16) / 255);
+};
+
+const P = {                          // live parameter set (URL-overridable)
+  glassColor : hex("color",  [1,1,1]),
+  bg         : hex("bgcolor",[0,0,0]),
+  c1         : hex("color1", [0.9686,0.4941,0.1765]),  // hour   #F77E2D
+  c2         : hex("color2", [0.1961,0.2157,0.2902]),  // minute #32374A
+  c3         : hex("color3", [0.9608,0.9608,0.9608]),  // second #F5F5F5
+  shadow     : num("shadow", 0.05),
+  bright     : num("bright", 0.05),
+  feed       : num("feed",   0.0540),
+  kill       : num("kill",   0.0616),
+  iter       : Math.round(num("iteration", 10)),
+};
+
+const PRESETS = {                    // themes from the original README
+  "1": { name:"ember",       color:[1,1,1], bg:[0,0,0], c1:[0.9686,0.4941,0.1765], c2:[0.1961,0.2157,0.2902], c3:[0.9608,0.9608,0.9608], shadow:.05, bright:.05, feed:.054, kill:.0616, iter:10 },
+  "2": { name:"cosmos black",color:[1,1,1], bg:[0,0,0], c1:[0.1961,0.2157,0.2902], c2:[0.9686,0.4941,0.1765], c3:[0.9608,0.9608,0.9608], shadow:.05, bright:.05, feed:.054, kill:.0616, iter:10 },
+  "3": { name:"sticky pink", color:[1,.933,.933], bg:[1,.933,1], c1:[1,.188,.027], c2:[1,1,1], c3:[.467,.733,.8], shadow:.1, bright:.1, feed:.1,  kill:.054, iter:15 },
+  "4": { name:"cozy blue",   color:[.863,.918,.925], bg:[.929,.937,.937], c1:[1,.667,.027], c2:[1,1,1], c3:[.467,.733,.8], shadow:.05, bright:.1, feed:.05, kill:.06,  iter:15 },
+};
+function applyPreset(p) {
+  P.glassColor = p.color; P.bg = p.bg; P.c1 = p.c1; P.c2 = p.c2; P.c3 = p.c3;
+  P.shadow = p.shadow; P.bright = p.bright; P.feed = p.feed; P.kill = p.kill; P.iter = p.iter;
+  document.body.style.background =
+    `rgb(${p.bg.map(v => Math.round(v*255)).join(",")})`;
+}
+
+/* ============================================================================
+   WATER CLOCK — a faithful recreation of chiuhans111's "Fluid Glass"
+   ----------------------------------------------------------------------------
+   The motion is three coupled systems, stepped 10× per frame at ~0.5× res:
+
+   1. REACTION–DIFFUSION (Gray–Scott, 3 chemicals). The digital time,
+      rasterized to a canvas every frame, feeds chemicals where the glyphs
+      are — so liquid continuously condenses out of the digits, buds into
+      droplets, and dissolves when the time changes.
+   2. NAVIER–STOKES fluid. The liquid's own thickness gradient accelerates
+      a velocity field (blobs push outward); a divergence-relaxation step
+      keeps it incompressible-ish; both velocity and chemicals are advected
+      semi-Lagrangian. The pointer stamps velocity through a flowmap: you
+      stir the clock.
+   3. GLASS SHADING. Thickness → surface normal → double refraction
+      (n = 1.33, water) with per-channel chromatic offsets, a thresholded
+      anisotropic specular streak, and a Fresnel edge — composited over an
+      analog background: three giant lens-circles (hour / minute / second)
+      orbiting the center, each refracting the layers behind it, drifting
+      on parallax from pointer or device tilt.
+   ==========================================================================*/
+
+
+
+/* ------------------------------ WebGL setup ------------------------------ */
+
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl2", {
+  alpha: false, antialias: false, depth: false, stencil: false,
+  premultipliedAlpha: false, preserveDrawingBuffer: false,
+});
+
+function fatal(msg) {
+  const el = document.getElementById("fail");
+  el.innerHTML = msg;
+  el.classList.add("show");
+  throw new Error(msg);
+}
+if (!gl) fatal("This water clock needs WebGL2.<br>Your browser or GPU settings have it turned off.");
+if (!gl.getExtension("EXT_color_buffer_float") &&
+    !gl.getExtension("EXT_color_buffer_half_float"))
+  fatal("This water clock needs float render targets<br>(EXT_color_buffer_float), which this GPU doesn't expose.");
+
+/* Fullscreen triangle: position −1…3 covers the screen, uv 0…2 matches. */
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1,-1, 0,0,   3,-1, 2,0,   -1,3, 0,2,
+]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+
+function compile(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    fatal(`Shader "${label}" failed:<br><pre style="text-align:left">${gl.getShaderInfoLog(s)}</pre>`);
+  return s;
+}
+function makeProgram(fragSrc, label) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT, label + ".vert"));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fragSrc, label + ".frag"));
+  gl.bindAttribLocation(p, 0, "position");
+  gl.bindAttribLocation(p, 1, "uv");
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    fatal(`Link "${label}" failed: ${gl.getProgramInfoLog(p)}`);
+  const uniforms = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const info = gl.getActiveUniform(p, i);
+    uniforms[info.name] = gl.getUniformLocation(p, info.name);
+  }
+  return { p, u: uniforms };
+}
+
+/* A render target: RGBA16F texture + FBO, linear, clamped. */
+function makeTarget(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  const t = {
+    tex, fbo, w, h,
+    setSize(nw, nh) {              // reallocates; contents are lost on purpose
+      if (nw === t.w && nh === t.h) return;
+      t.w = nw; t.h = nh;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, nw, nh, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    },
+  };
+  return t;
+}
+
+/* Run a program into a target (or the screen when target is null). */
+let boundTexUnit = 0;
+function bindTex(loc, tex) {
+  gl.activeTexture(gl.TEXTURE0 + boundTexUnit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(loc, boundTexUnit);
+  boundTexUnit++;
+}
+function run(prog, target, setUniforms) {
+  gl.useProgram(prog.p);
+  boundTexUnit = 0;
+  if (target) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, target.w, target.h);
+  } else {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  setUniforms(prog.u);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+const prog = {
+  copy       : makeProgram(FRAG_COPY, "copy"),
+  flow       : makeProgram(FRAG_FLOW, "flow"),
+  fluidVel   : makeProgram(FRAG_FLUID_VELOCITY, "fluidVelocity"),
+  divergence : makeProgram(FRAG_DIVERGENCE, "divergence"),
+  correction : makeProgram(FRAG_CORRECTION, "correction"),
+  advection  : makeProgram(FRAG_ADVECTION, "advection"),
+  rd         : makeProgram(FRAG_REACTION_DIFFUSION, "reactionDiffusion"),
+  bgClock    : makeProgram(FRAG_BACKGROUND_CLOCK, "backgroundClock"),
+  glass      : makeProgram(FRAG_GLASS, "glass"),
+  debug      : makeProgram(FRAG_DEBUG, "debug"),
+};
+
+/* ------------------------- targets & the time mask ------------------------ */
+
+let simW = 512, simH = 512;
+let chem     = makeTarget(simW, simH);   // rgb chemicals, a = thickness
+let chemTemp = makeTarget(simW, simH);
+let vel      = makeTarget(simW, simH);
+let velTemp  = makeTarget(simW, simH);
+let divTex   = makeTarget(simW, simH);
+let bg       = makeTarget(simW, simH);
+let flowA    = makeTarget(512, 512);     // pointer trail (fixed 512, like OGL)
+let flowB    = makeTarget(512, 512);
+
+/* The digital time, drawn to a 2D canvas each frame, becomes the RD mask.  */
+const textCanvas = document.createElement("canvas");
+const tctx = textCanvas.getContext("2d");
+const maskTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, maskTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+function drawTimeMask() {
+  const c = textCanvas, ctx = tctx;
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const now = new Date();
+  const two = v => v.toString().padStart(2, "0");
+  const mono = '"Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
+  if (c.width > c.height * 1.5) {
+    // Landscape: one line; the colon blinks each half-second.
+    const size = c.width / 8;
+    ctx.font = `${Math.round(size)}px ${mono}`;
+    const sep = now.getMilliseconds() < 500 ? ":" : " ";
+    ctx.fillText(
+      [two(now.getHours()), two(now.getMinutes()), two(now.getSeconds())].join(sep),
+      c.width / 2, c.height / 2
+    );
+  } else {
+    // Portrait: HH / MM / SS stacked.
+    const size = c.height / 4;
+    ctx.font = `${Math.round(size)}px ${mono}`;
+    ctx.fillText(two(now.getHours()),   c.width / 2, c.height / 2 - size);
+    ctx.fillText(two(now.getMinutes()), c.width / 2, c.height / 2);
+    ctx.fillText(two(now.getSeconds()), c.width / 2, c.height / 2 + size);
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+}
+
+/* ----------------------------- resize handling ---------------------------- */
+
+let needResize = true;
+function requestResize() { needResize = true; }
+window.addEventListener("resize", requestResize);
+
+function doResize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cssW = canvas.clientWidth  || window.innerWidth;
+  const cssH = canvas.clientHeight || window.innerHeight;
+  canvas.width  = Math.max(2, Math.round(cssW * dpr));
+  canvas.height = Math.max(2, Math.round(cssH * dpr));
+
+  // The original's sim-resolution rule, capped so phones stay smooth.
+  const scale = Math.max(0.4, Math.min(0.8,
+    (1024 / Math.min(cssW, cssH)) * (window.devicePixelRatio || 1)));
+  let w = Math.round((cssW * scale) / 4) * 4;
+  let h = Math.round((cssH * scale) / 4) * 4;
+  const cap = 1152 / Math.max(w, h);
+  if (cap < 1) { w = Math.round(w * cap / 4) * 4; h = Math.round(h * cap / 4) * 4; }
+  w = Math.max(64, w); h = Math.max(64, h);
+
+  // Preserve sim state across the resize: stash into the temps (still old
+  // size), resize primaries, stretch-copy back, then resize temps.
+  run(prog.copy, chemTemp, u => bindTex(u.inputMap, chem.tex));
+  run(prog.copy, velTemp,  u => bindTex(u.inputMap, vel.tex));
+
+  simW = w; simH = h;
+  textCanvas.width = w; textCanvas.height = h;   // mask only needs sim res
+  chem.setSize(w, h); vel.setSize(w, h); divTex.setSize(w, h); bg.setSize(w, h);
+
+  run(prog.copy, chem, u => bindTex(u.inputMap, chemTemp.tex));
+  run(prog.copy, vel,  u => bindTex(u.inputMap, velTemp.tex));
+
+  chemTemp.setSize(w, h); velTemp.setSize(w, h);
+}
+
+/* --------------------------- pointer & parallax --------------------------- */
+
+const flow = { mouse: [0.5, 0.5], velocity: [0, 0] };
+
+function pointerMove(x, y, dx, dy) {
+  const r = canvas.getBoundingClientRect();
+  flow.mouse[0] = (x - r.left) / r.width;
+  flow.mouse[1] = (r.bottom - y) / r.height;          // GL space, y-up
+  flow.velocity[0] += (dx / r.width) * simW;          // sim-pixel units
+  flow.velocity[1] += (dy / r.width) * simH;
+}
+window.addEventListener("mousemove", e => {
+  pointerMove(e.clientX, e.clientY, e.movementX, e.movementY);
+  parallaxMotion.x += e.movementX * 0.001;
+  parallaxMotion.y -= e.movementY * 0.001;
+});
+let prevTouch = null;
+window.addEventListener("touchmove", e => {
+  if (!e.touches.length) return;
+  e.preventDefault();
+  const t = e.touches[0];
+  if (!prevTouch) prevTouch = { x: t.clientX, y: t.clientY };
+  pointerMove(t.clientX, t.clientY, t.clientX - prevTouch.x, t.clientY - prevTouch.y);
+  prevTouch = { x: t.clientX, y: t.clientY };
+}, { passive: false });
+window.addEventListener("touchend", () => { prevTouch = null; });
+
+/* Parallax: pointer motion integrates into a spring-damped drift; on
+   phones, tilt relative to a slowly-adapting "natural" pose takes over.    */
+const parallax = { x: 0, y: 0 };
+const parallaxMotion = { x: 0, y: 0 };
+let tiltBase = null, tilt = null;
+window.addEventListener("deviceorientation", e => {
+  if (e.gamma == null || e.beta == null) return;
+  if (!tiltBase) tiltBase = { b: e.beta, g: e.gamma };
+  tiltBase.b += (e.beta  - tiltBase.b) * 0.01;   // the pose you're settling into
+  tiltBase.g += (e.gamma - tiltBase.g) * 0.01;
+  tilt = {
+    x: Math.sin((e.gamma - tiltBase.g) * Math.PI / 180),
+    y: Math.sin((e.beta  - tiltBase.b) * Math.PI / 180),
+  };
+});
+// iOS asks permission for orientation events; request it on first touch.
+window.addEventListener("touchstart", function ask() {
+  if (typeof DeviceOrientationEvent !== "undefined" &&
+      typeof DeviceOrientationEvent.requestPermission === "function") {
+    DeviceOrientationEvent.requestPermission().catch(() => {});
+  }
+  window.removeEventListener("touchstart", ask);
+}, { once: true });
+
+function updateParallax() {
+  if (tilt) {
+    parallax.x += (tilt.x * 0.6 - parallax.x) * 0.06;
+    parallax.y += (tilt.y * 0.6 - parallax.y) * 0.06;
+  } else {
+    parallax.x += parallaxMotion.x * 0.1;
+    parallax.y += parallaxMotion.y * 0.1;
+    parallax.x *= 0.99;
+    parallax.y *= 0.99;
+  }
+  parallaxMotion.x *= 0.8;
+  parallaxMotion.y *= 0.8;
+}
+
+/* ------------------------------- keyboard -------------------------------- */
+
+let paused = false;
+let debugMode = 0;  // 0 off, 1 thickness, 2 velocity, 3 background
+const veil = document.getElementById("veil");
+function setPaused(v) {
+  paused = v;
+  veil.classList.toggle("show", paused && veilIsGate);
+}
+let veilIsGate = false;
+window.addEventListener("keydown", e => {
+  if (PRESETS[e.key]) applyPreset(PRESETS[e.key]);
+  else if (e.key === " " || (e.key === "Enter" && veil.classList.contains("show"))) {
+    setPaused(!paused); e.preventDefault();
+  }
+  else if (e.key === "d") debugMode = (debugMode + 1) % 4;
+});
+
+/* Reduced motion: the piece is pure motion, so honor the preference by
+   starting paused behind an explicit opt-in.                                */
+if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+  veilIsGate = true;
+  setPaused(true);
+  veil.setAttribute("tabindex", "0");
+  veil.focus();
+}
+veil.addEventListener("click", () => setPaused(false));
+
+/* ------------------------------- frame loop ------------------------------- */
+
+function stepFlowmap() {
+  // Stamp pointer velocity into the trail, then swap; velocity resets so
+  // only fresh movement stirs the fluid.
+  run(prog.flow, flowB, u => {
+    bindTex(u.tMap, flowA.tex);
+    gl.uniform1f(u.uFalloff, 0.12 * 0.5);
+    gl.uniform1f(u.uAlpha, 0.8);
+    gl.uniform1f(u.uDissipation, 0.7);
+    gl.uniform2f(u.uMouse, flow.mouse[0], flow.mouse[1]);
+    gl.uniform2f(u.uVelocity, flow.velocity[0], flow.velocity[1]);
+  });
+  [flowA, flowB] = [flowB, flowA];
+  flow.velocity[0] = 0; flow.velocity[1] = 0;
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  if (paused) return;
+  if (needResize) { needResize = false; doResize(); }
+
+  stepFlowmap();
+  drawTimeMask();
+
+  // Velocity gains from thickness gradient + stirring.
+  run(prog.fluidVel, velTemp, u => {
+    bindTex(u.pressureMap, chem.tex);
+    bindTex(u.velocityMap, vel.tex);
+    bindTex(u.flowMap, flowA.tex);
+    gl.uniform2f(u.uSize, simW, simH);
+  });
+
+  // The coupled solve: pressure-relax, advect, react — ITER times a frame.
+  for (let i = 0; i < P.iter; i++) {
+    run(prog.divergence, divTex, u => {
+      bindTex(u.velocityMap, velTemp.tex);
+      gl.uniform2f(u.uSize, simW, simH);
+    });
+    run(prog.correction, vel, u => {
+      bindTex(u.pressureMap, divTex.tex);
+      bindTex(u.velocityMap, velTemp.tex);
+      gl.uniform2f(u.uSize, simW, simH);
+    });
+    run(prog.advection, velTemp, u => {
+      bindTex(u.inputMap, vel.tex);
+      bindTex(u.velocityMap, vel.tex);
+      gl.uniform2f(u.uSize, simW, simH);
+    });
+    run(prog.advection, chemTemp, u => {
+      bindTex(u.inputMap, chem.tex);
+      bindTex(u.velocityMap, vel.tex);
+      gl.uniform2f(u.uSize, simW, simH);
+    });
+    run(prog.rd, chem, u => {
+      bindTex(u.pressureMap, chemTemp.tex);
+      bindTex(u.maskTexture, maskTex);
+      gl.uniform1f(u.feed0, P.feed);
+      gl.uniform1f(u.kill0, P.kill);
+      gl.uniform2f(u.uSize, simW, simH);
+    });
+  }
+  run(prog.copy, vel, u => bindTex(u.inputMap, velTemp.tex));
+
+  // Analog background: hands as continuous fractions so nothing ever ticks.
+  const now = new Date();
+  const hands = [
+    now.getHours() + now.getMinutes() / 60 + now.getSeconds() / 3600,
+    now.getMinutes() + now.getSeconds() / 60 + now.getMilliseconds() / 60000,
+    now.getSeconds() + now.getMilliseconds() / 1000,
+  ];
+  run(prog.bgClock, bg, u => {
+    gl.uniform2f(u.uSize, simW, simH);
+    gl.uniform3f(u.clockHands, hands[0], hands[1], hands[2]);
+    gl.uniform3fv(u.bgcolor, P.bg);
+    gl.uniform3fv(u.circlecolor1, P.c1);
+    gl.uniform3fv(u.circlecolor2, P.c2);
+    gl.uniform3fv(u.circlecolor3, P.c3);
+    gl.uniform2f(u.parallax, parallax.x, parallax.y);
+  });
+
+  // Final composite to screen.
+  if (debugMode === 0) {
+    run(prog.glass, null, u => {
+      bindTex(u.pressureMap, chem.tex);
+      bindTex(u.backgroundMap, bg.tex);
+      gl.uniform3fv(u.glassColor, P.glassColor);
+      gl.uniform1f(u.shadowFactor, P.shadow);
+      gl.uniform1f(u.brightFactor, P.bright);
+      gl.uniform2f(u.parallax, parallax.x, parallax.y);
+      gl.uniform2f(u.uSize, simW, simH);
+    });
+  } else {
+    const src  = debugMode === 1 ? chem : debugMode === 2 ? vel : bg;
+    const mode = debugMode === 1 ? 2 : debugMode === 2 ? 1 : 0;
+    run(prog.debug, null, u => {
+      bindTex(u.inputMap, src.tex);
+      gl.uniform1f(u.uMode, mode);
+    });
+  }
+
+  updateParallax();
+}
+
+applyPreset(PRESETS["1"]);
+// URL params override the default preset when present.
+if ([...qs.keys()].length) {
+  P.glassColor = hex("color", P.glassColor);
+  P.bg = hex("bgcolor", P.bg);
+  P.c1 = hex("color1", P.c1); P.c2 = hex("color2", P.c2); P.c3 = hex("color3", P.c3);
+  P.shadow = num("shadow", P.shadow); P.bright = num("bright", P.bright);
+  P.feed = num("feed", P.feed); P.kill = num("kill", P.kill);
+  P.iter = Math.round(num("iteration", P.iter));
+  document.body.style.background =
+    `rgb(${P.bg.map(v => Math.round(v*255)).join(",")})`;
+}
+
+// The hint should describe what this device can actually do.
+if (matchMedia("(pointer: coarse)").matches) {
+  document.getElementById("hint").textContent = "touch to stir · tilt to shift the light";
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

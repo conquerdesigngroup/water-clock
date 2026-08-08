@@ -1,0 +1,19 @@
+{
+  "name": "water-clock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A liquid-glass water clock: Gray–Scott reaction–diffusion fed by the digital time, a Navier–Stokes solver to make it slosh, and refractive glass shading — recreating chiuhans111's Fluid Glass as one dependency-free WebGL2 file.",
+  "scripts": {
+    "dev": "node scripts/serve.js",
+    "build": "node scripts/build.js",
+    "validate": "node scripts/validate-shaders.js",
+    "test": "node scripts/build.js && node test/smoke.test.js",
+    "check": "npm run validate && npm test"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
