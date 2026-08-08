@@ -7,9 +7,11 @@
  *   - setting a uniform while the wrong program is bound
  *   - init-order crashes, resize crashes, event-handler crashes
  *
- * Two scenarios: a normal 60-frame run with resize / pointer / theme keys /
- * pause / debug cycling, and a prefers-reduced-motion run that must start
- * paused behind the veil until the user opts in.
+ * Three scenarios: a normal 60-frame run with resize / pointer / theme keys /
+ * pause / debug cycling; a `?text=` run that must rasterize words instead of
+ * the clock, wrap a long phrase, fall back to the clock when cleared, and
+ * survive a lap through all eight backgrounds; and a prefers-reduced-motion
+ * run that must start paused behind the veil until the user opts in.
  *
  * Run `npm test` (builds first). No GPU needed.
  */
@@ -116,12 +118,24 @@ function runScenario({ name, reducedMotion, url }) {
     }
   };
 
+  /* 2D stub that remembers assigned properties (so `font` reads back) and
+     returns a monospace-ish measureText — the text fitter needs both.      */
   const ctx2dCalls = [];
-  const make2D = canvas =>
-    new Proxy({}, {
-      get: (_, k) => (k === "canvas" ? canvas : (...a) => { ctx2dCalls.push([k, a]); }),
-      set: () => true,
+  const make2D = canvas => {
+    const state = { font: "16px monospace" };
+    return new Proxy({}, {
+      get: (_, k) => {
+        if (k === "canvas") return canvas;
+        if (k in state) return state[k];
+        if (k === "measureText") return s => {
+          ctx2dCalls.push(["measureText", [s]]);
+          return { width: String(s).length * (parseFloat(state.font) || 16) * 0.6 };
+        };
+        return (...a) => { ctx2dCalls.push([k, a]); };
+      },
+      set: (_, k, v) => { state[k] = v; return true; },
     });
+  };
 
   let theGL = null;
   window.HTMLCanvasElement.prototype.getContext = function (kind) {
@@ -154,7 +168,7 @@ const assert = (cond, msg) => { if (!cond) failures.push(msg); };
   window.dispatchEvent(mm);
   pump(10);
 
-  for (const key of ["2", "3", "4", "1", "d", "d", "d", "d", " ", " "]) {
+  for (const key of ["2", "3", "4", "1", "d", "d", "d", "d", "B", " ", " "]) {
     window.dispatchEvent(new window.KeyboardEvent("keydown", { key }));
     pump(2);
   }
@@ -170,11 +184,72 @@ const assert = (cond, msg) => { if (!cond) failures.push(msg); };
     fillTexts.every(t => /^\d\d[: ]\d\d[: ]\d\d$/.test(t)),
     `normal: unexpected mask text: ${JSON.stringify(fillTexts[0])}`
   );
+
+  // `t` opens the word input, and typing must not fire the shortcuts.
+  const input = window.document.getElementById("say");
+  window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "t" }));
+  assert(input.classList.contains("show"), "normal: `t` did not open the word input");
+  const before = gl().__draws();
+  input.dispatchEvent(new window.KeyboardEvent("keydown", { key: " ", bubbles: true }));
+  pump(3);
+  assert(gl().__draws() > before, "normal: typing a space paused the simulation");
+
   const seps = new Set(fillTexts.map(t => t[2]));
   console.log(`normal        OK — ${gl().__draws()} draws, mask "${fillTexts.at(-1)}", separators seen: ${[...seps].map(JSON.stringify).join(" ")}`);
 }
 
-/* Scenario 2: prefers-reduced-motion gate ---------------------------------- */
+/* Scenario 2: words instead of the clock, and every background --------------- */
+{
+  const { window, pump, gl, ctx2dCalls } = runScenario({
+    name: "text",
+    reducedMotion: false,
+    url: "https://example.test/?text=hello%20water&background=plasma",
+  });
+  pump(8);
+
+  const texts = () => ctx2dCalls.filter(c => c[0] === "fillText").map(c => c[1][0]);
+  assert(texts().length > 0, "text: nothing was rasterized");
+  assert(texts().join(" ").includes("hello"),
+    `text: ?text= words never drawn (got ${JSON.stringify(texts())})`);
+  assert(!texts().some(t => /\d\d[: ]\d\d[: ]\d\d/.test(t)),
+    "text: the clock was drawn even though ?text= was set");
+
+  // Typing replaces the mask live, and long input has to wrap onto several lines.
+  const input = window.document.getElementById("say");
+  assert(input.value === "hello water", `text: input not seeded (${input.value})`);
+  const mark = ctx2dCalls.length;
+  input.value = "the quick brown fox jumps over the lazy dog again and again and again";
+  input.dispatchEvent(new window.Event("input"));
+  pump(3);
+  const fresh = ctx2dCalls.slice(mark).filter(c => c[0] === "fillText").map(c => c[1][0]);
+  assert(fresh.length > 1, `text: long phrase did not wrap (lines: ${fresh.length})`);
+  assert(fresh.join(" ").includes("quick"), "text: typed words were not rasterized");
+
+  // Clearing it restores the clock.
+  input.value = "";
+  input.dispatchEvent(new window.Event("input"));
+  pump(3);
+  assert(ctx2dCalls.slice(-6).some(c => c[0] === "fillText" && /\d\d[: ]\d\d/.test(c[1][0])),
+    "text: clearing the words did not bring the clock back");
+
+  // Cycle every background; each must name itself and none may break GL.
+  const toast = window.document.getElementById("toast");
+  const seen = [];
+  for (let i = 0; i < 10; i++) {
+    window.dispatchEvent(new window.KeyboardEvent("keydown", { key: "b" }));
+    pump(2);
+    seen.push(toast.textContent.replace("background · ", ""));
+  }
+  const unique = [...new Set(seen)];
+  assert(unique.length === 8, `text: expected 8 backgrounds, saw ${unique.length}: ${unique}`);
+  assert(seen[0] !== seen[1] && seen[0] === seen[8], `text: backgrounds did not wrap: ${seen}`);
+
+  const errs = gl().__errors;
+  assert(errs.length === 0, `text: GL stub errors:\n  ${errs.join("\n  ")}`);
+  console.log(`text+bg       OK — words rasterized & wrapped, backgrounds: ${unique.join(" ")}`);
+}
+
+/* Scenario 3: prefers-reduced-motion gate ---------------------------------- */
 {
   const { window, pump, gl } = runScenario({ name: "reduced", reducedMotion: true });
   const veil = window.document.getElementById("veil");

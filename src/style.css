@@ -11,14 +11,59 @@
     position: fixed; left: 0; right: 0; bottom: max(14px, env(safe-area-inset-bottom));
     text-align: center; font-size: 11px; letter-spacing: 0.14em;
     color: rgba(255,255,255,.4); text-transform: lowercase;
+    text-shadow: 0 1px 3px rgba(0,0,0,.6);   /* stays readable on light themes */
     pointer-events: none; user-select: none;
     opacity: 0; animation: hint 9s ease forwards .8s;
   }
   @keyframes hint { 10% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0; } }
 
+  /* Shared look for every chrome element: quiet, monospace, never opaque */
+  #say, #ui button, #toast {
+    font: inherit; font-size: 12px; letter-spacing: .14em; text-transform: lowercase;
+    color: rgba(255,255,255,.72); background: rgba(0,0,0,.34);
+    border: 1px solid rgba(255,255,255,.16); border-radius: 999px;
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  }
+
+  /* Word input — top-centre, so a phone keyboard never covers it */
+  #say {
+    position: fixed; top: max(18px, env(safe-area-inset-top)); left: 50%;
+    transform: translate(-50%, -14px); width: min(440px, calc(100vw - 40px));
+    padding: 11px 18px; text-align: center; text-transform: none; letter-spacing: .08em;
+    opacity: 0; visibility: hidden; transition: opacity .25s ease, transform .25s ease;
+  }
+  #say.show { opacity: 1; visibility: visible; transform: translate(-50%, 0); }
+  #say::placeholder { color: rgba(255,255,255,.32); }
+  #say:focus { outline: none; border-color: rgba(255,255,255,.4); color: #fff; }
+
+  /* Controls — bottom-right, faint until you reach for them */
+  #ui {
+    position: fixed; z-index: 1; display: flex; gap: 8px;
+    right: max(14px, env(safe-area-inset-right));
+    bottom: max(14px, env(safe-area-inset-bottom));
+  }
+  #ui button {
+    padding: 8px 14px; cursor: pointer; opacity: .34;
+    transition: opacity .2s ease, border-color .2s ease;
+  }
+  #ui button:hover, #ui button:focus-visible { opacity: 1; border-color: rgba(255,255,255,.4); }
+
+  /* Toast — names whatever you just switched to, then gets out of the way */
+  #toast {
+    position: fixed; left: 50%; transform: translate(-50%, 6px);
+    bottom: max(52px, calc(env(safe-area-inset-bottom) + 52px));
+    padding: 7px 14px; pointer-events: none; user-select: none;
+    opacity: 0; transition: opacity .2s ease, transform .2s ease;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  @media (prefers-reduced-motion: reduce) {
+    #say, #ui button, #toast { transition: none; }
+  }
+
   /* Reduced-motion veil: the whole piece is motion, so we start paused and let the user opt in */
   #veil, #fail {
-    position: fixed; inset: 0; display: none; place-items: center;
+    position: fixed; inset: 0; z-index: 2; display: none; place-items: center;
     background: #000; color: rgba(255,255,255,.75);
     font-size: 13px; letter-spacing: .12em; text-align: center; line-height: 2;
     padding: 24px; cursor: pointer;

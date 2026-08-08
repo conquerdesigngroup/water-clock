@@ -44,6 +44,10 @@ if (html.includes("src/main.js") || html.includes("src/style.css"))
   throw new Error("build: template substitution failed — check index.html tags");
 
 fs.mkdirSync(path.join(root, "dist"), { recursive: true });
-const out = path.join(root, "dist", "water-clock.html");
-fs.writeFileSync(out, html);
-console.log(`built ${path.relative(root, out)} (${(html.length / 1024).toFixed(1)} kB)`);
+// water-clock.html is the file you double-click; index.html is the same
+// bytes under the name a static host (Vercel) serves at "/".
+const outputs = ["water-clock.html", "index.html"];
+for (const name of outputs) fs.writeFileSync(path.join(root, "dist", name), html);
+console.log(
+  `built dist/{${outputs.join(",")}} (${(html.length / 1024).toFixed(1)} kB)`
+);

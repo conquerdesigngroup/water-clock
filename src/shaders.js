@@ -185,10 +185,17 @@ void main(){
 `;/*END*/
 
 /*GLSL:backgroundClock*/
-/* The analog face: three lens-circles, one per hand, orbiting the center
-   at half the larger screen dimension. Each is a bright rim + faint fill,
-   and its interior refracts every layer drawn behind it. Layers sit at
-   different parallax depths, so tilting the device separates them.         */
+/* Everything the water refracts. uBgMode picks one of eight worlds; they
+   all paint from the same four theme colours (bgcolor + circlecolor1..3),
+   so themes and backgrounds compose instead of fighting.
+
+   Mode 0 is the original analog face: three lens-circles, one per hand,
+   orbiting the center at half the larger screen dimension. Each is a
+   bright rim + faint fill, and its interior refracts every layer drawn
+   behind it. Layers sit at different parallax depths, so tilting the
+   device separates them. The other seven are static-camera fields —
+   what matters for the glass is that they carry mid-scale structure for
+   the refraction to bend.                                                 */
 export const FRAG_BACKGROUND_CLOCK = HEAD + `
 uniform vec2 uSize;
 uniform vec3 clockHands;     // hours, minutes, seconds (fractional)
@@ -197,7 +204,31 @@ uniform vec3 circlecolor1;
 uniform vec3 circlecolor2;
 uniform vec3 circlecolor3;
 uniform vec2 parallax;
+uniform float uBgMode;       // 0 lens … 7 stripes
+uniform float uTime;         // seconds since load
 
+/* ---- value noise, the cheapest thing that still looks organic ---- */
+float hash21(vec2 p){
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float fbm(vec2 p){
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++){ v += a * vnoise(p); p *= 2.02; a *= 0.5; }
+  return v;
+}
+
+/* ---- 0: the original orbiting lens-circles ---- */
 vec3 drawCircle(vec2 coord, float t){
   float radius = max(uSize.x, uSize.y) * 0.5;
   vec2 origin = vec2(sin(t * PI * 2.0), cos(t * PI * 2.0)) * radius;
@@ -213,8 +244,7 @@ vec3 drawCircle(vec2 coord, float t){
 
   return vec3(displacement, f);
 }
-
-void main(){
+vec3 bgLens(){
   vec2 coord = (vUv - 0.5) * uSize + parallax * 2.0;
 
   vec3 circle3 = drawCircle(coord, clockHands.z / 60.0);   // second
@@ -227,6 +257,106 @@ void main(){
   color = mix(color, circlecolor1, circle1.z);
   color = mix(color, circlecolor2, circle2.z);
   color = mix(color, circlecolor3, circle3.z);
+  return color;
+}
+
+/* ---- 1: near-flat, with just enough centre glow that the refraction
+         still has something to bend ---- */
+vec3 bgSolid(vec2 q){
+  return mix(bgcolor, circlecolor2, 0.12 * smoothstep(1.2, 0.0, length(q)));
+}
+
+/* ---- 2: slow aurora bands ---- */
+vec3 bgAurora(vec2 q, float t){
+  float n = fbm(q * 1.6 + vec2(t * 0.05, t * 0.03));
+  float m = fbm(q * 2.4 - vec2(t * 0.04, 0.0) + n);
+  vec3 c = mix(bgcolor, circlecolor1, smoothstep(0.25, 0.85, m + q.y * 0.35 + 0.35));
+  c = mix(c, circlecolor2, smoothstep(0.45, 1.0, n * 1.3 - q.y * 0.4 + 0.45));
+  c += circlecolor3 * pow(max(0.0, m - 0.55), 2.0) * 1.2;
+  return c;
+}
+
+/* ---- 3: drifting blueprint grid ---- */
+vec3 bgGrid(vec2 q, float t){
+  float vign = 1.0 - smoothstep(0.25, 1.25, length(q));
+  vec2 g = q * 9.0 + vec2(t * 0.06, sin(t * 0.11) * 0.3);
+  vec2 f = abs(fract(g - 0.5) - 0.5);
+  float minor = 1.0 - smoothstep(0.0, 0.045, min(f.x, f.y));
+  vec2 f2 = abs(fract(g * 0.25 - 0.5) - 0.5);
+  float major = 1.0 - smoothstep(0.0, 0.012, min(f2.x, f2.y));
+
+  vec3 c = mix(bgcolor, circlecolor2, 0.3 * vign);
+  c = mix(c, circlecolor3, minor * 0.22 * vign);
+  c = mix(c, circlecolor1, major * 0.7 * vign);
+  return c;
+}
+
+/* ---- 4: concentric rings breathing outward ---- */
+vec3 bgRings(vec2 q, float t){
+  float r = length(q);
+  float w = sin(r * 24.0 - t * 0.9);
+  float band = smoothstep(0.0, 0.7, w);
+  float thin = 1.0 - smoothstep(0.0, 0.14, abs(w));
+
+  vec3 c = mix(bgcolor, circlecolor2, band * 0.32);
+  c = mix(c, circlecolor1, thin * 0.7 * (1.0 - smoothstep(0.15, 1.35, r)));
+  c = mix(c, circlecolor3, pow(max(0.0, 1.0 - r * 1.7), 3.0) * 0.55);
+  return c;
+}
+
+/* ---- 5: domain-warped plasma ---- */
+vec3 bgPlasma(vec2 q, float t){
+  vec2 p = q * 2.0;
+  float a = fbm(p + vec2(t * 0.06, -t * 0.05));
+  float b = fbm(p * 1.7 + vec2(-t * 0.04, t * 0.07) + a * 1.5);
+  float d = fbm(p * 2.6 + b * 2.0 - t * 0.03);
+
+  vec3 c = mix(bgcolor, circlecolor1, smoothstep(0.2, 0.8, a));
+  c = mix(c, circlecolor2, smoothstep(0.3, 0.9, b) * 0.85);
+  c = mix(c, circlecolor3, smoothstep(0.55, 1.0, d) * 0.7);
+  return c;
+}
+
+/* ---- 6: nebula + twinkling starfield ---- */
+vec3 bgStars(vec2 q, float t){
+  vec3 c = mix(bgcolor, circlecolor2, pow(max(0.0, 1.0 - length(q) * 0.8), 2.0) * 0.45);
+  float neb = fbm(q * 1.5 + vec2(t * 0.02, -t * 0.015));
+  c = mix(c, circlecolor1, smoothstep(0.55, 1.0, neb) * 0.55);
+
+  vec2 g = q * 26.0;
+  vec2 id = floor(g), fr = fract(g) - 0.5;
+  float h = hash21(id);
+  vec2 off = (vec2(hash21(id + 3.7), hash21(id + 9.1)) - 0.5) * 0.7;
+  float twinkle = 0.55 + 0.45 * sin(t * 1.8 + h * 40.0);
+  float star = smoothstep(0.07, 0.0, length(fr - off)) * step(0.86, h) * twinkle;
+  return c + circlecolor3 * star;
+}
+
+/* ---- 7: wide diagonal bands ---- */
+vec3 bgStripes(vec2 q, float t){
+  float s = dot(q, normalize(vec2(0.8, 0.6))) * 2.2 + t * 0.12;
+  float phase = s * PI * 2.0;
+  vec3 c = bgcolor;
+  c = mix(c, circlecolor1, smoothstep(0.35, 1.0, sin(phase) * 0.5 + 0.5) * 0.85);
+  c = mix(c, circlecolor2, smoothstep(0.35, 1.0, sin(phase + 2.094) * 0.5 + 0.5) * 0.85);
+  c = mix(c, circlecolor3, smoothstep(0.35, 1.0, sin(phase + 4.188) * 0.5 + 0.5) * 0.85);
+  return c;
+}
+
+void main(){
+  vec2 q = vUv - 0.5;
+  q.x *= uSize.x / max(1.0, uSize.y);       // aspect-correct, so nothing stretches
+  q += parallax * 0.06;                      // every world drifts with the light
+
+  vec3 color;
+  if      (uBgMode < 0.5) color = bgLens();
+  else if (uBgMode < 1.5) color = bgSolid(q);
+  else if (uBgMode < 2.5) color = bgAurora(q, uTime);
+  else if (uBgMode < 3.5) color = bgGrid(q, uTime);
+  else if (uBgMode < 4.5) color = bgRings(q, uTime);
+  else if (uBgMode < 5.5) color = bgPlasma(q, uTime);
+  else if (uBgMode < 6.5) color = bgStars(q, uTime);
+  else                    color = bgStripes(q, uTime);
 
   gl_FragColor = vec4(color, 1.0);
 }

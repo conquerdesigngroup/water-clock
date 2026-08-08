@@ -12,6 +12,23 @@ export const hex = (k, d) => {
   if (!/^[0-9a-f]{6}$/i.test(h)) return d;
   return [0,2,4].map(i => parseInt(h.slice(i, i+2), 16) / 255);
 };
+export const str = (k, d) => (qs.has(k) ? qs.get(k) : d);
+
+/* The worlds the water refracts. Index === uBgMode in the background
+   shader; the names are what `?background=` accepts and what the toast
+   shows. Backgrounds are deliberately orthogonal to the colour themes —
+   4 themes × 8 backgrounds, and switching one never resets the other.   */
+export const BACKGROUNDS = [
+  "lens", "solid", "aurora", "grid", "rings", "plasma", "stars", "stripes",
+];
+export const bgIndex = (k, d) => {
+  if (!qs.has(k)) return d;
+  const v = qs.get(k).trim().toLowerCase();
+  const byName = BACKGROUNDS.indexOf(v);
+  if (byName >= 0) return byName;
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n >= 0 && n < BACKGROUNDS.length ? n : d;
+};
 
 export const P = {                          // live parameter set (URL-overridable)
   glassColor : hex("color",  [1,1,1]),
@@ -24,6 +41,9 @@ export const P = {                          // live parameter set (URL-overridab
   feed       : num("feed",   0.0540),
   kill       : num("kill",   0.0616),
   iter       : Math.round(num("iteration", 10)),
+  bgMode     : bgIndex("background", 0),
+  // Words to condense out of instead of the time. Empty string = clock.
+  text       : str("text", "").slice(0, 140),
 };
 
 export const PRESETS = {                    // themes from the original README

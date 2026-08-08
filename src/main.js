@@ -25,7 +25,7 @@ import {
   FRAG_CORRECTION, FRAG_ADVECTION, FRAG_REACTION_DIFFUSION,
   FRAG_BACKGROUND_CLOCK, FRAG_GLASS, FRAG_DEBUG,
 } from "./shaders.js";
-import { qs, num, hex, P, PRESETS, applyPreset } from "./params.js";
+import { qs, num, hex, P, PRESETS, BACKGROUNDS, applyPreset } from "./params.js";
 
 /* ------------------------------ WebGL setup ------------------------------ */
 
@@ -153,7 +153,9 @@ let bg       = makeTarget(simW, simH);
 let flowA    = makeTarget(512, 512);     // pointer trail (fixed 512, like OGL)
 let flowB    = makeTarget(512, 512);
 
-/* The digital time, drawn to a 2D canvas each frame, becomes the RD mask.  */
+/* The time — or whatever words you type — drawn to a 2D canvas, becomes
+   the RD mask: chemicals are fed wherever the glyphs are, so liquid
+   condenses out of them forever.                                          */
 const textCanvas = document.createElement("canvas");
 const tctx = textCanvas.getContext("2d");
 const maskTex = gl.createTexture();
@@ -163,33 +165,107 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-function drawTimeMask() {
+const MONO = '"Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+const LINE_HEIGHT = 1.2;
+const measure = (ctx, s) => ctx.measureText(s).width;
+
+/* A word too wide to ever fit (a URL, "aaaaaa…") is chopped instead of
+   dragging the whole layout down to 8px.                                  */
+function breakLong(ctx, word, maxW) {
+  if (measure(ctx, word) <= maxW) return [word];
+  const out = [];
+  let cur = "";
+  for (const ch of word) {
+    if (cur && measure(ctx, cur + ch) > maxW) { out.push(cur); cur = ch; }
+    else cur += ch;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/* Greedy word wrap at a given font size. Explicit newlines are honored. */
+function wrapLines(ctx, paras, size, maxW) {
+  ctx.font = `${Math.round(size)}px ${MONO}`;
+  const lines = [];
+  for (const para of paras) {
+    const words = para.split(/\s+/).filter(Boolean).flatMap(w => breakLong(ctx, w, maxW));
+    if (!words.length) { lines.push(""); continue; }
+    let line = words[0];
+    for (let i = 1; i < words.length; i++) {
+      const merged = line + " " + words[i];
+      if (measure(ctx, merged) <= maxW) line = merged;
+      else { lines.push(line); line = words[i]; }
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+/* Largest size whose wrap fits the box — binary search, so one long word
+   and a whole sentence both land at a sensible scale.                     */
+function fitText(ctx, text, maxW, maxH) {
+  const paras = text.split("\n");
+  let lo = 8, hi = Math.max(12, maxH), best = null;
+  for (let i = 0; i < 14; i++) {
+    const mid = (lo + hi) / 2;
+    const lines = wrapLines(ctx, paras, mid, maxW);
+    const fits = lines.every(l => measure(ctx, l) <= maxW) &&
+                 lines.length * mid * LINE_HEIGHT <= maxH;
+    if (fits) { best = { lines, size: mid }; lo = mid; } else hi = mid;
+  }
+  return best || { lines: [text], size: 8 };
+}
+
+function drawWords(c, ctx, words) {
+  const { lines, size } = fitText(ctx, words, c.width * 0.86, c.height * 0.72);
+  ctx.font = `${Math.round(size)}px ${MONO}`;
+  const lh = size * LINE_HEIGHT;
+  const top = c.height / 2 - ((lines.length - 1) * lh) / 2;
+  lines.forEach((line, i) => ctx.fillText(line, c.width / 2, top + i * lh));
+}
+
+function drawClock(c, ctx, parts, sep) {
+  if (c.width > c.height * 1.5) {
+    // Landscape: one line; the colon blinks each half-second.
+    const size = c.width / 8;
+    ctx.font = `${Math.round(size)}px ${MONO}`;
+    ctx.fillText(parts.join(sep), c.width / 2, c.height / 2);
+  } else {
+    // Portrait: HH / MM / SS stacked.
+    const size = c.height / 4;
+    ctx.font = `${Math.round(size)}px ${MONO}`;
+    ctx.fillText(parts[0], c.width / 2, c.height / 2 - size);
+    ctx.fillText(parts[1], c.width / 2, c.height / 2);
+    ctx.fillText(parts[2], c.width / 2, c.height / 2 + size);
+  }
+}
+
+/* Rasterize + upload only when the content actually changes: the clock
+   moves twice a second, typed words only when you type.                   */
+let lastMaskKey = "";
+function drawMask() {
   const c = textCanvas, ctx = tctx;
+  const words = P.text.trim();
+
+  let key, parts = null, sep = "";
+  if (words) {
+    key = `w|${c.width}x${c.height}|${words}`;
+  } else {
+    const now = new Date();
+    const two = v => v.toString().padStart(2, "0");
+    sep = now.getMilliseconds() < 500 ? ":" : " ";
+    parts = [two(now.getHours()), two(now.getMinutes()), two(now.getSeconds())];
+    key = `c|${c.width}x${c.height}|${parts.join(sep)}`;
+  }
+  if (key === lastMaskKey) return;
+  lastMaskKey = key;
+
   ctx.clearRect(0, 0, c.width, c.height);
   ctx.fillStyle = "#fff";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  const now = new Date();
-  const two = v => v.toString().padStart(2, "0");
-  const mono = '"Roboto Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-
-  if (c.width > c.height * 1.5) {
-    // Landscape: one line; the colon blinks each half-second.
-    const size = c.width / 8;
-    ctx.font = `${Math.round(size)}px ${mono}`;
-    const sep = now.getMilliseconds() < 500 ? ":" : " ";
-    ctx.fillText(
-      [two(now.getHours()), two(now.getMinutes()), two(now.getSeconds())].join(sep),
-      c.width / 2, c.height / 2
-    );
-  } else {
-    // Portrait: HH / MM / SS stacked.
-    const size = c.height / 4;
-    ctx.font = `${Math.round(size)}px ${mono}`;
-    ctx.fillText(two(now.getHours()),   c.width / 2, c.height / 2 - size);
-    ctx.fillText(two(now.getMinutes()), c.width / 2, c.height / 2);
-    ctx.fillText(two(now.getSeconds()), c.width / 2, c.height / 2 + size);
-  }
+  if (words) drawWords(c, ctx, words);
+  else drawClock(c, ctx, parts, sep);
 
   gl.bindTexture(gl.TEXTURE_2D, maskTex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
@@ -299,7 +375,7 @@ function updateParallax() {
   parallaxMotion.y *= 0.8;
 }
 
-/* ------------------------------- keyboard -------------------------------- */
+/* --------------------------- controls & keyboard -------------------------- */
 
 let paused = false;
 let debugMode = 0;  // 0 off, 1 thickness, 2 velocity, 3 background
@@ -309,11 +385,60 @@ function setPaused(v) {
   veil.classList.toggle("show", paused && veilIsGate);
 }
 let veilIsGate = false;
+
+/* A one-line toast: whatever you just switched to, named, then gone.       */
+const toast = document.getElementById("toast");
+let toastTimer = 0;
+function say(msg) {
+  toast.textContent = msg;
+  toast.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("show"), 1500);
+}
+
+function setPreset(p) { applyPreset(p); say(`theme · ${p.name}`); }
+function cycleBackground(step) {
+  P.bgMode = (P.bgMode + step + BACKGROUNDS.length) % BACKGROUNDS.length;
+  say(`background · ${BACKGROUNDS[P.bgMode]}`);
+}
+
+/* Type words and the reaction–diffusion feeds off them instead of the
+   time — same mask, same physics, so they bud and slosh identically.
+   Clearing the field puts the clock back.                                  */
+const sayInput = document.getElementById("say");
+sayInput.value = P.text;
+function openSay() {
+  sayInput.classList.add("show");
+  sayInput.focus();
+  sayInput.select();
+}
+function closeSay() { sayInput.classList.remove("show"); sayInput.blur(); }
+
+sayInput.addEventListener("input", () => { P.text = sayInput.value; });
+sayInput.addEventListener("keydown", e => {
+  e.stopPropagation();                       // never let shortcuts eat typing
+  if (e.key === "Enter") closeSay();
+  else if (e.key === "Escape") {
+    sayInput.value = ""; P.text = ""; closeSay(); say("clock");
+  }
+});
+
+const btn = (id, fn) => document.getElementById(id).addEventListener("click", e => {
+  e.currentTarget.blur();                    // so space doesn't re-trigger it
+  fn();
+});
+btn("btnType", openSay);
+btn("btnBg", () => cycleBackground(1));
+
 window.addEventListener("keydown", e => {
-  if (PRESETS[e.key]) applyPreset(PRESETS[e.key]);
+  if (e.target === sayInput) return;
+  if (PRESETS[e.key]) setPreset(PRESETS[e.key]);
   else if (e.key === " " || (e.key === "Enter" && veil.classList.contains("show"))) {
     setPaused(!paused); e.preventDefault();
   }
+  else if (e.key === "b") cycleBackground(1);
+  else if (e.key === "B") cycleBackground(-1);
+  else if (e.key === "t") { openSay(); e.preventDefault(); }
   else if (e.key === "d") debugMode = (debugMode + 1) % 4;
 });
 
@@ -328,6 +453,8 @@ if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
 veil.addEventListener("click", () => setPaused(false));
 
 /* ------------------------------- frame loop ------------------------------- */
+
+const startTime = Date.now();   // drives the animated backgrounds
 
 function stepFlowmap() {
   // Stamp pointer velocity into the trail, then swap; velocity resets so
@@ -350,7 +477,7 @@ function frame() {
   if (needResize) { needResize = false; doResize(); }
 
   stepFlowmap();
-  drawTimeMask();
+  drawMask();
 
   // Velocity gains from thickness gradient + stirring.
   run(prog.fluidVel, velTemp, u => {
@@ -406,6 +533,8 @@ function frame() {
     gl.uniform3fv(u.circlecolor2, P.c2);
     gl.uniform3fv(u.circlecolor3, P.c3);
     gl.uniform2f(u.parallax, parallax.x, parallax.y);
+    gl.uniform1f(u.uBgMode, P.bgMode);
+    gl.uniform1f(u.uTime, (now.getTime() - startTime) / 1000);
   });
 
   // Final composite to screen.
@@ -446,7 +575,8 @@ if ([...qs.keys()].length) {
 
 // The hint should describe what this device can actually do.
 if (matchMedia("(pointer: coarse)").matches) {
-  document.getElementById("hint").textContent = "touch to stir · tilt to shift the light";
+  document.getElementById("hint").textContent =
+    "touch to stir · tilt to shift the light · tap type / background below";
 }
 
 requestAnimationFrame(frame);

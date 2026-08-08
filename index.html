@@ -8,7 +8,18 @@
 </head>
 <body>
 <canvas id="gl"></canvas>
-<div id="hint">move to stir &nbsp;·&nbsp; keys 1–4 change theme &nbsp;·&nbsp; space pauses</div>
+
+<input id="say" type="text" maxlength="140" autocomplete="off" autocorrect="off"
+       autocapitalize="off" spellcheck="false" placeholder="type something…"
+       aria-label="words to condense out of the water — empty shows the clock">
+
+<div id="ui">
+  <button id="btnType" type="button" title="type words instead of the time (t)">type</button>
+  <button id="btnBg" type="button" title="cycle the background (b)">background</button>
+</div>
+
+<div id="toast" aria-live="polite"></div>
+<div id="hint">move to stir &nbsp;·&nbsp; t types words &nbsp;·&nbsp; b changes background &nbsp;·&nbsp; 1–4 theme &nbsp;·&nbsp; space pauses</div>
 <div id="veil">motion is paused<br><span style="opacity:.6">click to start the water clock</span></div>
 <div id="fail"></div>
 
